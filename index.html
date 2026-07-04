@@ -68,6 +68,7 @@
 <div id="hint">Draw with finger or Pencil · two fingers pan &amp; zoom endlessly</div>
 
 <div class="bar" id="bar">
+  <span style="font-size:10px;opacity:.45;letter-spacing:.05em;">v3</span>
   <button id="bPen" class="on" title="Pen">✏️</button>
   <button id="bErase" title="Eraser">◻️</button>
   <span class="sep"></span>
@@ -339,6 +340,16 @@ window.addEventListener('keydown', function(e){
   if (e.key === 'p' || e.key === 'b') setTool('pen');
 });
 window.addEventListener('keyup', function(e){ if (e.code === 'Space') spaceHeld = false; });
+
+/* iOS ignores user-scalable=no — block native pinch/double-tap zoom explicitly */
+document.addEventListener('gesturestart', function(e){ e.preventDefault(); });
+document.addEventListener('gesturechange', function(e){ e.preventDefault(); });
+var lastTouchEnd = 0;
+document.addEventListener('touchend', function(e){
+  var now = Date.now();
+  if (now - lastTouchEnd < 300) e.preventDefault();
+  lastTouchEnd = now;
+}, { passive: false });
 
 cv.addEventListener('pointerdown', function(e){
   e.preventDefault();
