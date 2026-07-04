@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Endless Canvas</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{height:100%;overflow:hidden;overscroll-behavior:none;background:#F7F5F0;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    touch-action:none;position:fixed;inset:0;width:100%;}
+  #c{position:absolute;inset:0;touch-action:none;cursor:crosshair;display:block;}
+
+  .bar{
+    position:fixed;left:50%;transform:translateX(-50%);
+    bottom:calc(14px + env(safe-area-inset-bottom));
+    background:#232220;color:#EDEAE3;
+    border-radius:22px;padding:8px 12px;
+    display:flex;align-items:center;gap:6px;
+    box-shadow:0 6px 24px rgba(0,0,0,.28);
+    user-select:none;-webkit-user-select:none;
+    max-width:calc(100vw - 20px);flex-wrap:wrap;justify-content:center;
+    touch-action:auto;z-index:5;
+  }
+  .bar button{
+    background:transparent;border:none;color:#EDEAE3;
+    width:38px;height:38px;border-radius:12px;font-size:18px;
+    display:flex;align-items:center;justify-content:center;cursor:pointer;
+  }
+  .bar button:active{background:rgba(255,255,255,.12);}
+  .bar button.on{background:#3E6B8F;color:#fff;}
+  .bar button:focus-visible{outline:2px solid #3E6B8F;outline-offset:2px;}
+  .sep{width:1px;height:26px;background:rgba(255,255,255,.15);}
+  .swatch{width:24px;height:24px;border-radius:50%;border:2px solid transparent;cursor:pointer;flex:none;background:none;padding:0;}
+  .swatch.on{border-color:#fff;transform:scale(1.15);}
+  input[type=range]{width:84px;accent-color:#3E6B8F;}
+
+  #zoom{
+    position:fixed;top:calc(12px + env(safe-area-inset-top));left:50%;transform:translateX(-50%);
+    background:#232220;color:#EDEAE3;
+    font-variant-numeric:tabular-nums;font-size:13px;letter-spacing:.04em;
+    padding:6px 14px;border-radius:14px;opacity:0;transition:opacity .25s;
+    cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.2);z-index:5;
+  }
+  #zoom.show{opacity:1;}
+
+  #hint{
+    position:fixed;top:calc(52px + env(safe-area-inset-top));left:50%;transform:translateX(-50%);
+    font-size:12px;color:#8a8781;text-align:center;pointer-events:none;
+    transition:opacity 1s;white-space:nowrap;z-index:5;
+  }
+  #err{
+    position:fixed;left:8px;right:8px;top:8px;z-index:99;display:none;
+    background:#7a1f1f;color:#fff;font-size:12px;padding:8px 12px;border-radius:10px;
+    font-family:monospace;white-space:pre-wrap;
+  }
+  @media (prefers-reduced-motion: reduce){
+    #zoom,#hint{transition:none;}
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="err"></div>
+<div id="zoom" title="Tap to reset view">1×</div>
+<div id="hint">Draw with finger or Pencil · two fingers pan &amp; zoom endlessly</div>
+
+<div class="bar" id="bar">
+  <button id="bPen" class="on" title="Pen">✏️</button>
+  <button id="bErase" title="Eraser">◻️</button>
+  <span class="sep"></span>
+  <span id="swatches" style="display:flex;gap:6px;align-items:center;"></span>
+  <input type="color" id="cPick" value="#2B2A28" title="Custom color"
+         style="width:26px;height:26px;border:none;background:transparent;cursor:pointer;">
+  <span class="sep"></span>
+  <input type="range" id="rSize" min="1" max="30" value="4" title="Pen size">
+  <span class="sep"></span>
+  <button id="bUndo" title="Undo">↩︎</button>
+  <button id="bRedo" title="Redo">↪︎</button>
+  <span class="sep"></span>
+  <button id="bFinger" class="on" title="Finger draws (toggle)">☝️</button>
+  <button id="bHome" title="Reset view">⌂</button>
+  <span class="sep"></span>
+  <button id="bPng" title="Export PNG">🖼</button>
+  <button id="bSave" title="Save file">💾</button>
+  <button id="bLoad" title="Open file">📂</button>
+  <input type="file" id="fLoad" accept=".json,application/json" hidden>
+</div>
+
+<script>
+"use strict";
+/* surface real errors on screen (the sandboxed preview otherwise hides them) */
+window.onerror = function(msg, src, line, col){
+  var el = document.getElementById('err');
+  el.style.display = 'block';
+  el.textContent = 'Error: ' + msg + ' (line ' + line + ':' + col + ')';
+  return false;
+};
+
+var PAPER = '#F7F5F0';
+var cv = document.getElementById('c');
+var ctx = cv.getContext('2d');
+var dpr = 1, cw = 0, ch = 0;   // canvas CSS size, tracked every frame
+var dirty = true;
+
+/* ---------- world / view ----------
+   view.s = screen px per world unit. Strokes are vectors in world
+   coordinates, so any zoom depth re-renders crisp. */
+var view = { x: 0, y: 0, s: 1 };
+var S_MIN = 1e-6, S_MAX = 1e7;
+function s2w(sx, sy){ return { x: sx / view.s + view.x, y: sy / view.s + view.y }; }
+
+/* ---------- document ---------- */
+var strokes = [];       // {pts:[{x,y,p}], color, w (world units), bb}
+var undoStack = [], redoStack = [];
+
+function pushUndo(a){ undoStack.push(a); if (undoStack.length > 200) undoStack.shift(); redoStack.length = 0; }
+
+function bbox(pts, w){
+  var x0=Infinity, y0=Infinity, x1=-Infinity, y1=-Infinity;
+  for (var i=0;i<pts.length;i++){ var p=pts[i];
+    if(p.x<x0)x0=p.x; if(p.x>x1)x1=p.x; if(p.y<y0)y0=p.y; if(p.y>y1)y1=p.y; }
+  return {x0:x0-w, y0:y0-w, x1:x1+w, y1:y1+w};
+}
+
+/* ---------- rendering ---------- */
+function syncSize(){
+  var w = cv.clientWidth || window.innerWidth;
+  var h = cv.clientHeight || window.innerHeight;
+  var d = Math.max(1, window.devicePixelRatio || 1);
+  if (w !== cw || h !== ch || d !== dpr){
+    cw = w; ch = h; dpr = d;
+    cv.width  = Math.max(1, Math.round(w * d));
+    cv.height = Math.max(1, Math.round(h * d));
+    dirty = true;
+  }
+}
+
+function drawStroke(s){
+  var pts = s.pts;
+  var lw = s.w * view.s;
+  ctx.strokeStyle = s.color;
+  ctx.fillStyle = s.color;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  if (pts.length === 1){
+    var p = pts[0];
+    ctx.beginPath();
+    ctx.arc((p.x-view.x)*view.s, (p.y-view.y)*view.s,
+            Math.max(lw*(0.4+p.p)*0.5, 0.35), 0, 6.2832);
+    ctx.fill();
+    return;
+  }
+  var px = [], py = [];
+  for (var i=0;i<pts.length;i++){
+    px.push((pts[i].x-view.x)*view.s);
+    py.push((pts[i].y-view.y)*view.s);
+  }
+  for (i=1;i<pts.length;i++){
+    var press = (pts[i-1].p + pts[i].p) * 0.5;
+    ctx.lineWidth = Math.max(lw * (0.35 + press * 1.1), 0.3);
+    ctx.beginPath();
+    if (i === 1) ctx.moveTo(px[0], py[0]);
+    else ctx.moveTo((px[i-1]+px[i-2])/2, (py[i-1]+py[i-2])/2);
+    ctx.quadraticCurveTo(px[i-1], py[i-1], (px[i-1]+px[i])/2, (py[i-1]+py[i])/2);
+    if (i === pts.length-1) ctx.lineTo(px[i], py[i]);
+    ctx.stroke();
+  }
+}
+
+function drawGrid(){
+  /* adaptive dot grid: spacing follows powers of 8, cross-fading
+     between octaves so scale is always felt */
+  var raw = 90 / view.s;
+  var k = Math.log(raw) / Math.log(8);
+  var k0 = Math.floor(k);
+  var oct = [[k0, 1-(k-k0)], [k0+1, k-k0]];
+  for (var o=0;o<2;o++){
+    var step = Math.pow(8, oct[o][0]);
+    var pxs = step * view.s;
+    if (pxs < 26 || pxs > 1200) continue;
+    var cols = Math.ceil(cw / pxs) + 2, rows = Math.ceil(ch / pxs) + 2;
+    if (cols * rows > 5000) continue;
+    var alpha = 0.16 * oct[o][1] * Math.min(1, (pxs - 26) / 50);
+    if (alpha <= 0.006) continue;
+    ctx.fillStyle = 'rgba(60,58,54,' + alpha.toFixed(3) + ')';
+    var wx0 = Math.floor(view.x / step) * step;
+    var wy0 = Math.floor(view.y / step) * step;
+    for (var gx=0; gx<cols; gx++){
+      for (var gy=0; gy<rows; gy++){
+        ctx.fillRect((wx0 + gx*step - view.x)*view.s - 1,
+                     (wy0 + gy*step - view.y)*view.s - 1, 2.2, 2.2);
+      }
+    }
+  }
+}
+
+function render(){
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = PAPER;
+  ctx.fillRect(0, 0, cw, ch);
+  try { drawGrid(); } catch(e){}
+  var vx0 = view.x, vy0 = view.y;
+  var vx1 = view.x + cw/view.s, vy1 = view.y + ch/view.s;
+  for (var i=0;i<strokes.length;i++){
+    var s = strokes[i];
+    var b = s.bb || (s.bb = bbox(s.pts, s.w));
+    if (b.x1 < vx0 || b.x0 > vx1 || b.y1 < vy0 || b.y0 > vy1) continue;
+    var pxSize = Math.max(b.x1-b.x0, b.y1-b.y0) * view.s;
+    if (pxSize < 0.4){
+      ctx.fillStyle = s.color;
+      ctx.fillRect((b.x0-view.x)*view.s, (b.y0-view.y)*view.s, 0.7, 0.7);
+      continue;
+    }
+    drawStroke(s);
+  }
+}
+
+function loop(){
+  syncSize();
+  if (dirty){ dirty = false; render(); }
+  requestAnimationFrame(loop);
+}
+
+/* ---------- tools / UI ---------- */
+var tool = 'pen';
+var color = '#2B2A28';
+var sizePx = 4;             // screen px at draw time → world width = sizePx/view.s
+var fingerDraws = true;   // finger draws by default; auto-off when a Pencil is detected
+
+var COLORS = ['#2B2A28','#B3402A','#3E6B8F','#3E7A4C','#C98A1B','#7A4E8F'];
+var swWrap = document.getElementById('swatches');
+COLORS.forEach(function(c, i){
+  var d = document.createElement('button');
+  d.className = 'swatch' + (i===0 ? ' on' : '');
+  d.style.background = c; d.title = c;
+  d.addEventListener('click', function(){
+    color = c; setTool('pen');
+    var all = swWrap.querySelectorAll('.swatch');
+    for (var j=0;j<all.length;j++) all[j].classList.remove('on');
+    d.classList.add('on');
+  });
+  swWrap.appendChild(d);
+});
+document.getElementById('cPick').addEventListener('input', function(e){
+  color = e.target.value; setTool('pen');
+  var all = swWrap.querySelectorAll('.swatch');
+  for (var j=0;j<all.length;j++) all[j].classList.remove('on');
+});
+document.getElementById('rSize').addEventListener('input', function(e){ sizePx = +e.target.value; });
+
+var bPen = document.getElementById('bPen'), bErase = document.getElementById('bErase');
+function setTool(t){
+  tool = t;
+  bPen.classList.toggle('on', t === 'pen');
+  bErase.classList.toggle('on', t === 'erase');
+}
+bPen.addEventListener('click', function(){ setTool('pen'); });
+bErase.addEventListener('click', function(){ setTool('erase'); });
+
+var bFinger = document.getElementById('bFinger');
+bFinger.addEventListener('click', function(){
+  fingerDraws = !fingerDraws;
+  bFinger.classList.toggle('on', fingerDraws);
+});
+
+document.getElementById('bUndo').addEventListener('click', undo);
+document.getElementById('bRedo').addEventListener('click', redo);
+function undo(){
+  var a = undoStack.pop(); if (!a) return;
+  if (a.t === 'add'){ strokes.pop(); redoStack.push(a); }
+  else if (a.t === 'del'){
+    var args = [a.i, 0].concat(a.s);
+    Array.prototype.splice.apply(strokes, args);
+    redoStack.push(a);
+  }
+  dirty = true;
+}
+function redo(){
+  var a = redoStack.pop(); if (!a) return;
+  if (a.t === 'add'){ strokes.push(a.s); undoStack.push(a); }
+  else if (a.t === 'del'){
+    strokes = strokes.filter(function(s){ return a.s.indexOf(s) === -1; });
+    undoStack.push(a);
+  }
+  dirty = true;
+}
+
+document.getElementById('bHome').addEventListener('click', resetView);
+document.getElementById('zoom').addEventListener('click', resetView);
+function resetView(){
+  view.x = -cw/2; view.y = -ch/2; view.s = 1;
+  dirty = true; showZoom();
+}
+
+var zEl = document.getElementById('zoom');
+var zTimer = null;
+function fmtZoom(s){
+  if (s >= 0.995) return s >= 100 ? Math.round(s).toLocaleString()+'×' : (Math.round(s*10)/10)+'×';
+  return '1/' + Math.round(1/s).toLocaleString() + '×';
+}
+function showZoom(){
+  zEl.textContent = fmtZoom(view.s);
+  zEl.classList.add('show');
+  if (zTimer) clearTimeout(zTimer);
+  zTimer = setTimeout(function(){ zEl.classList.remove('show'); }, 1400);
+}
+
+/* ---------- input ---------- */
+var pointers = {};          // pointerId -> {x,y}
+var nPointers = 0;
+var drawing = null;
+var panLast = null;
+var pinch = null;
+var erasing = false;
+var spaceHeld = false;
+
+function pointerList(){
+  var out = [];
+  for (var k in pointers) out.push(pointers[k]);
+  return out;
+}
+
+function isDrawPointer(e){
+  if (e.pointerType === 'pen') return true;
+  if (e.pointerType === 'mouse') return e.buttons === 1 && !e.ctrlKey && !spaceHeld;
+  return fingerDraws;
+}
+
+window.addEventListener('keydown', function(e){
+  if (e.code === 'Space') spaceHeld = true;
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')){
+    e.preventDefault();
+    if (e.shiftKey) redo(); else undo();
+  }
+  if (e.key === 'e') setTool('erase');
+  if (e.key === 'p' || e.key === 'b') setTool('pen');
+});
+window.addEventListener('keyup', function(e){ if (e.code === 'Space') spaceHeld = false; });
+
+cv.addEventListener('pointerdown', function(e){
+  e.preventDefault();
+  try { cv.setPointerCapture(e.pointerId); } catch(err){}
+  pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+  nPointers++;
+  document.getElementById('hint').style.opacity = 0;
+
+  /* palm rejection: the moment a Pencil is used, finger switches to panning */
+  if (e.pointerType === 'pen' && fingerDraws){
+    fingerDraws = false;
+    bFinger.classList.remove('on');
+  }
+
+  if (nPointers === 2){
+    if (drawing){ strokes.pop(); drawing = null; dirty = true; }
+    panLast = null; erasing = false;
+    var pl = pointerList();
+    pinch = { d: Math.hypot(pl[0].x-pl[1].x, pl[0].y-pl[1].y),
+              mx: (pl[0].x+pl[1].x)/2, my: (pl[0].y+pl[1].y)/2 };
+    return;
+  }
+  if (nPointers > 2) return;
+
+  if (isDrawPointer(e)){
+    if (tool === 'erase'){ erasing = true; eraseAt(e.clientX, e.clientY); return; }
+    var p = s2w(e.clientX, e.clientY);
+    drawing = { pts: [{ x: p.x, y: p.y, p: e.pressure > 0 ? e.pressure : 0.5 }],
+                color: color, w: sizePx / view.s, bb: null };
+    strokes.push(drawing);
+    dirty = true;
+  } else {
+    panLast = { x: e.clientX, y: e.clientY };
+  }
+});
+
+cv.addEventListener('pointermove', function(e){
+  if (!pointers[e.pointerId]) return;
+  e.preventDefault();
+  pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+
+  if (nPointers === 2 && pinch){
+    var pl = pointerList();
+    var d = Math.hypot(pl[0].x-pl[1].x, pl[0].y-pl[1].y);
+    var mx = (pl[0].x+pl[1].x)/2, my = (pl[0].y+pl[1].y)/2;
+    var before = s2w(mx, my);
+    view.s = Math.min(S_MAX, Math.max(S_MIN, view.s * (d / Math.max(pinch.d, 1))));
+    var after = s2w(mx, my);
+    view.x += before.x - after.x + (pinch.mx - mx) / view.s;
+    view.y += before.y - after.y + (pinch.my - my) / view.s;
+    pinch = { d: d, mx: mx, my: my };
+    dirty = true; showZoom();
+    return;
+  }
+
+  if (erasing){ eraseAt(e.clientX, e.clientY); return; }
+
+  if (drawing){
+    var evs = (typeof e.getCoalescedEvents === 'function') ? e.getCoalescedEvents() : null;
+    if (!evs || !evs.length) evs = [e];
+    for (var i=0;i<evs.length;i++){
+      var ev = evs[i];
+      var p = s2w(ev.clientX, ev.clientY);
+      var last = drawing.pts[drawing.pts.length-1];
+      if (Math.hypot(p.x-last.x, p.y-last.y) < 0.6 / view.s) continue;
+      drawing.pts.push({ x: p.x, y: p.y, p: ev.pressure > 0 ? ev.pressure : 0.5 });
+    }
+    dirty = true;
+    return;
+  }
+
+  if (panLast){
+    view.x -= (e.clientX - panLast.x) / view.s;
+    view.y -= (e.clientY - panLast.y) / view.s;
+    panLast = { x: e.clientX, y: e.clientY };
+    dirty = true;
+  }
+});
+
+function endPointer(e){
+  if (!pointers[e.pointerId]) return;
+  delete pointers[e.pointerId];
+  nPointers = Math.max(0, nPointers - 1);
+  if (nPointers < 2) pinch = null;
+  if (drawing){
+    drawing.bb = bbox(drawing.pts, drawing.w);
+    pushUndo({ t: 'add', s: drawing });
+    drawing = null;
+  }
+  if (nPointers === 0){ erasing = false; panLast = null; }
+  dirty = true;
+}
+cv.addEventListener('pointerup', endPointer);
+cv.addEventListener('pointercancel', endPointer);
+cv.addEventListener('lostpointercapture', function(){});
+
+/* wheel / trackpad zoom (desktop) */
+cv.addEventListener('wheel', function(e){
+  e.preventDefault();
+  var factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.012 : 0.0022));
+  var before = s2w(e.clientX, e.clientY);
+  view.s = Math.min(S_MAX, Math.max(S_MIN, view.s * factor));
+  var after = s2w(e.clientX, e.clientY);
+  view.x += before.x - after.x;
+  view.y += before.y - after.y;
+  dirty = true; showZoom();
+}, { passive: false });
+
+/* eraser: removes whole strokes within a screen-space radius */
+function eraseAt(sx, sy){
+  var r = 14 / view.s;
+  var p = s2w(sx, sy);
+  var removed = [];
+  var firstIdx = -1;
+  var kept = [];
+  for (var i=0;i<strokes.length;i++){
+    var s = strokes[i];
+    var b = s.bb || (s.bb = bbox(s.pts, s.w));
+    var hit = false;
+    if (!(p.x < b.x0-r || p.x > b.x1+r || p.y < b.y0-r || p.y > b.y1+r)){
+      for (var j=0;j<s.pts.length;j++){
+        var q = s.pts[j];
+        if (Math.hypot(q.x-p.x, q.y-p.y) < r + s.w){ hit = true; break; }
+      }
+    }
+    if (hit){ removed.push(s); if (firstIdx < 0) firstIdx = i; }
+    else kept.push(s);
+  }
+  if (removed.length){
+    strokes = kept;
+    pushUndo({ t: 'del', i: firstIdx, s: removed });
+    dirty = true;
+  }
+}
+
+/* ---------- export / save / load ---------- */
+document.getElementById('bPng').addEventListener('click', function(){
+  syncSize(); render();
+  var a = document.createElement('a');
+  a.download = 'endless-canvas.png';
+  a.href = cv.toDataURL('image/png');
+  document.body.appendChild(a); a.click(); a.remove();
+});
+document.getElementById('bSave').addEventListener('click', function(){
+  var data = { v: 1, view: view,
+    strokes: strokes.map(function(s){ return { pts: s.pts, color: s.color, w: s.w }; }) };
+  var blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+  var a = document.createElement('a');
+  a.download = 'endless-canvas.json';
+  a.href = URL.createObjectURL(blob);
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); }, 5000);
+});
+document.getElementById('bLoad').addEventListener('click', function(){
+  document.getElementById('fLoad').click();
+});
+document.getElementById('fLoad').addEventListener('change', function(e){
+  var f = e.target.files[0]; if (!f) return;
+  var reader = new FileReader();
+  reader.onload = function(){
+    try {
+      var data = JSON.parse(reader.result);
+      strokes = (data.strokes || []).map(function(s){
+        s.bb = bbox(s.pts, s.w); return s;
+      });
+      if (data.view){ view.x = data.view.x; view.y = data.view.y; view.s = data.view.s; }
+      undoStack = []; redoStack = [];
+      dirty = true; showZoom();
+    } catch(err){
+      alert('Could not read that file — it is not a saved canvas.');
+    }
+  };
+  reader.readAsText(f);
+  e.target.value = '';
+});
+
+/* ---------- go ---------- */
+syncSize();
+resetView();
+setTimeout(function(){ document.getElementById('hint').style.opacity = 0; }, 6000);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
